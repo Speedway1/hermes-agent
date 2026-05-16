@@ -50,6 +50,32 @@ DEFAULT_TTS_MODEL = "eleven_flash_v2_5"
 SAMPLE_RATE = 24000                           # pcm_24000 → 24kHz s16le mono
 
 # ---------------------------------------------------------------------------
+# PulseAudio mute/unmute helpers (modelled on Vexa tts-playback.ts)
+# ---------------------------------------------------------------------------
+from subprocess import CalledProcessError, TimeoutExpired as _TimeoutExpired
+
+def _unmute_pulseaudio(sink_name: str = "tess_mic_sink", source_name: str = "tess_mic_src") -> None:
+    """Unmute PulseAudio sink + source so TTS audio reaches the meeting."""
+    try:
+        subprocess.run(["pactl", "set-sink-mute", sink_name, "0"],
+                       capture_output=True, timeout=2)
+        subprocess.run(["pactl", "set-source-mute", source_name, "0"],
+                       capture_output=True, timeout=2)
+    except (FileNotFoundError, CalledProcessError, _TimeoutExpired):
+        pass  # pactl may not be available — non-fatal
+
+
+def _mute_pulseaudio(sink_name: str = "tess_mic_sink", source_name: str = "tess_mic_src") -> None:
+    """Re-mute PulseAudio after speech completes."""
+    try:
+        subprocess.run(["pactl", "set-sink-mute", sink_name, "1"],
+                       capture_output=True, timeout=2)
+        subprocess.run(["pactl", "set-source-mute", source_name, "1"],
+                       capture_output=True, timeout=2)
+    except (FileNotFoundError, CalledProcessError, _TimeoutExpired):
+        pass
+
+# ---------------------------------------------------------------------------
 # Credentials — from .env only
 # ---------------------------------------------------------------------------
 def _load_creds() -> tuple[str, str]:
@@ -126,14 +152,20 @@ class TessRealtimeSession:
         self._cancel_flag = threading.Event()
         self._connected = True   # we don't have a persistent WS, flag is for compat
         # Two output modes:
-        # - pcm_mode=True:  write raw 24kHz s16le mono PCM (for paplay)
-        # - pcm_mode=False: write 48kHz WAV (for --use-file-for-fake-audio-capture)
+        # - fifo_mode=True:  open named FIFO, write 24kHz s16le mono PCM (for pacat)
+        # - pcm_mode=True:   write raw 24kHz s16le mono PCM to file (for paplay)
+        # - pcm_mode=False:  write 48kHz WAV (for --use-file-for-fake-audio-capture)
         self._audio_ready: bool = False
         self._audio_duration_s: float = 3.0
+        self._fifo_mode: bool = False
         self._pcm_mode: bool = False
 
+    def set_fifo_mode(self, enabled: bool = True) -> None:
+        """Switch to FIFO output (open/write/close per utterance)."""
+        self._fifo_mode = enabled
+
     def set_pcm_mode(self, enabled: bool = True) -> None:
-        """Switch to raw PCM output (24kHz s16le mono)."""
+        """Switch to raw PCM file output (24kHz s16le mono)."""
         self._pcm_mode = enabled
 
     # ── lifecycle (API compat) ───────────────────────────────────────────
@@ -180,9 +212,10 @@ class TessRealtimeSession:
             if self._cancel_flag.is_set():
                 break   # barge-in — stop generating more audio
 
-            # Budget guard
+            # Budget guard — raises RuntimeError if blocked; warning
+            # return value (boolean) is deliberately unused here.
             try:
-                warned = _check_budget(sent)
+                _check_budget(sent)
             except RuntimeError as e:
                 # Budget blocked mid-speech — stop here
                 break
@@ -206,36 +239,51 @@ class TessRealtimeSession:
         # ── Step 4: Write output ──────────────────────────────────────
         with self._write_lock:
             if self.audio_sink_path is not None:
-                self.audio_sink_path.parent.mkdir(parents=True, exist_ok=True)
-                if self._pcm_mode:
-                    # Raw 24kHz s16le mono PCM — paplay reads this directly.
-                    with open(self.audio_sink_path, "wb") as f:
-                        f.write(bytes(all_pcm))
-                    bytes_written = len(all_pcm)
-                    self._audio_duration_s = (len(all_pcm) / 2) / SAMPLE_RATE
-                else:
-                    # WAV at 48kHz — for --use-file-for-fake-audio-capture.
-                    import wave as _wave
-                    WAV_SAMPLE_RATE = 48000
-                    # Up-sample 24kHz → 48kHz: duplicate each sample
-                    src_samples = len(all_pcm) // 2
-                    dst_pcm = bytearray(src_samples * 4)
-                    for si in range(src_samples):
-                        sample = struct.unpack_from("<h", all_pcm, si * 2)[0]
-                        struct.pack_into("<h", dst_pcm, si * 4, sample)
-                        struct.pack_into("<h", dst_pcm, si * 4 + 2, sample)
-                    with open(self.audio_sink_path, "wb") as f:
-                        with _wave.open(f, "wb") as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)
-                            wf.setframerate(WAV_SAMPLE_RATE)
-                            wf.writeframes(bytes(dst_pcm))
-                    bytes_written = len(all_pcm)
-                    self._audio_duration_s = (len(dst_pcm) / 2) / WAV_SAMPLE_RATE
-                self.audio_bytes_out += bytes_written
-                self.last_audio_out_at = time.time()
-                # Signal that new audio is ready
-                self._audio_ready = True
+                # Unmute PulseAudio before writing audio (modelled on Vexa's
+                # TTSPlaybackService).  Muted in the finally block below so
+                # we never leave the mic open on a write failure.
+                _unmute_pulseaudio()
+                try:
+                    self.audio_sink_path.parent.mkdir(parents=True, exist_ok=True)
+                    if self._fifo_mode:
+                        # Named FIFO — open, write, close. pacat reads from
+                        # the other end. Close signals EOF → pacat exits.
+                        with open(self.audio_sink_path, "wb") as f:
+                            f.write(bytes(all_pcm))
+                        bytes_written = len(all_pcm)
+                        self._audio_duration_s = (len(all_pcm) / 2) / SAMPLE_RATE
+                    elif self._pcm_mode:
+                        # Raw 24kHz s16le mono PCM — paplay reads directly.
+                        with open(self.audio_sink_path, "wb") as f:
+                            f.write(bytes(all_pcm))
+                        bytes_written = len(all_pcm)
+                        self._audio_duration_s = (len(all_pcm) / 2) / SAMPLE_RATE
+                    else:
+                        # WAV at 48kHz — for --use-file-for-fake-audio-capture.
+                        import wave as _wave
+                        WAV_SAMPLE_RATE = 48000
+                        # Up-sample 24kHz → 48kHz: duplicate each sample.
+                        src_samples = len(all_pcm) // 2
+                        dst_pcm = bytearray(src_samples * 4)
+                        for si in range(src_samples):
+                            sample = struct.unpack_from("<h", all_pcm, si * 2)[0]
+                            struct.pack_into("<h", dst_pcm, si * 4, sample)
+                            struct.pack_into("<h", dst_pcm, si * 4 + 2, sample)
+                        with open(self.audio_sink_path, "wb") as f:
+                            with _wave.open(f, "wb") as wf:
+                                wf.setnchannels(1)
+                                wf.setsampwidth(2)
+                                wf.setframerate(WAV_SAMPLE_RATE)
+                                wf.writeframes(bytes(dst_pcm))
+                        bytes_written = len(all_pcm)
+                        self._audio_duration_s = (len(dst_pcm) / 2) / WAV_SAMPLE_RATE
+                    self.audio_bytes_out += bytes_written
+                    self.last_audio_out_at = time.time()
+                    self._audio_ready = True
+                finally:
+                    # ALWAYS re-mute — prevents ambient audio leaking into
+                    # the meeting if the write fails mid-speech.
+                    _mute_pulseaudio()
 
         duration_ms = (time.monotonic() - start) * 1000.0
         return {

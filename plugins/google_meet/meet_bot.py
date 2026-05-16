@@ -268,12 +268,11 @@ def _start_realtime_speaker(
     stop_flag: dict,
     state: "_BotState",
 ) -> None:
-    """Wire up TessRealtimeSession + speaker thread + PCM pump (paplay).
+    """Wire up TessRealtimeSession + speaker thread + PCM pump (pacat via FIFO).
 
-    The speaker thread reads text lines from ``say_queue.jsonl``, sends each
-    to Groq → ElevenLabs Heather, and writes raw 24kHz s16le mono PCM into
-    ``speaker.pcm``. A separate pump process (paplay) streams that PCM into
-    the PulseAudio null-sink so Chrome's fake mic picks it up.
+    Creates a named FIFO; pacat reads from it and streams to the PulseAudio sink.
+    The speaker thread opens the FIFO and writes ElevenLabs PCM bytes directly —
+    no file overwrites, no EOF issues. Kill pacat for barge-in.
     """
     try:
         from plugins.google_meet.realtime.tess_client import (
@@ -284,18 +283,25 @@ def _start_realtime_speaker(
         state.set(error=f"tess_client import failed: {e}")
         return
 
-    pcm_path = out_dir / "speaker.pcm"
+    import os as _os
+
+    fifo_path = out_dir / "speaker.fifo"
     queue_path = out_dir / SAY_QUEUE_FILENAME
     processed_path = out_dir / "say_processed.jsonl"
-    pcm_path.write_bytes(b"")
+
+    # Remove stale fifo and recreate
+    if fifo_path.exists():
+        fifo_path.unlink()
+    _os.mkfifo(str(fifo_path))
+
     queue_path.touch()
 
     try:
         session = TessRealtimeSession(
-            audio_sink_path=pcm_path,
+            audio_sink_path=fifo_path,
             sample_rate=24000,
         )
-        session.set_pcm_mode(True)
+        session.set_fifo_mode(True)
         session.connect()
     except Exception as e:
         state.set(error=f"realtime connect failed: {e}")
@@ -306,7 +312,7 @@ def _start_realtime_speaker(
     def _stop_fn():
         return stop_flag.get("stop", False)
 
-    rt["speaker_stop"] = lambda: stop_flag.__setitem__("stop", stop_flag.get("stop", False))
+    rt["speaker_stop"] = lambda: stop_flag.__setitem__("stop", True)
 
     speaker = TessRealtimeSpeaker(
         session=session,
@@ -324,20 +330,22 @@ def _start_realtime_speaker(
     t_speaker.start()
     rt["speaker_thread"] = t_speaker
 
-    # PCM pump: paplay streams speaker.pcm (24kHz s16le mono) into
-    # the PulseAudio null-sink that Chrome's fake mic reads from.
+    # PCM pump: pacat reads from FIFO, streams to the null-sink.
+    # pacat exits cleanly when the FIFO writer closes; we restart per utterance.
+    # This avoids the file-overwrite/EOF race that plagued the paplay approach.
     import subprocess as _sp
-    sink = (rt.get("bridge_info") or {}).get("write_target") or "hermes_meet_sink"
+    sink = (rt.get("bridge_info") or {}).get("write_target") or "tess_mic_sink"
     try:
         proc = _sp.Popen(
             [
-                "paplay",
+                "pacat",
+                "--playback",
                 "--raw",
                 "--rate=24000",
                 "--format=s16le",
                 "--channels=1",
                 f"--device={sink}",
-                str(pcm_path),
+                str(fifo_path),
             ],
             stdin=_sp.DEVNULL,
             stdout=_sp.DEVNULL,
@@ -345,7 +353,7 @@ def _start_realtime_speaker(
         )
         rt["pcm_pump"] = proc
     except FileNotFoundError:
-        state.set(error="paplay not found — install pulseaudio-utils")
+        state.set(error="pacat not found — install pulseaudio-utils")
 
 
 def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
@@ -436,22 +444,22 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
         )
         return 3
 
-    # Chrome args: fake UI + fake device. Silence WAV SEEDS the fake device
-    # so Meet's initial getUserMedia doesn't break (required for JOINING).
-    # PulseAudio PULSE_SOURCE provides actual audio once connected.
-    wav_path = out_dir / "speaker.wav"
-    import wave as _wv
-    with open(wav_path, "wb") as f:
-        with _wv.open(f, "wb") as wf:
-            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(48000)
-            wf.writeframes(b'\x00' * (48000 * 5 * 2))  # 5s silence
+    # Chrome uses PulseAudio for real audio routing — NO fake device flags.
+    # `PULSE_SOURCE` points at the virtual mic; `PULSE_SINK` routes Meet output.
+    # `--use-fake-ui-for-media-stream` auto-accepts the mic/cam permission prompt
+    # without bypassing the actual OS audio stack.
     chrome_env = os.environ.copy()
+    # Clean Chrome args modelled on Vexa getAuthenticatedBrowserArgs() +
+    # MeetBeats audio-processing bypass. NO aggressive flags
+    # (--disable-web-security, --ignore-certificate-errors) — those trigger
+    # Google bot detection on authenticated joins.
+    # --disable-features=WebRtcApmInAudioService kills the WebRTC audio
+    # processing module that classifies TTS as "non-speech noise".
     chrome_args = [
         "--use-fake-ui-for-media-stream",
-        "--use-fake-device-for-media-stream",
-        f"--use-file-for-fake-audio-capture={wav_path}",
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
+        "--disable-features=AudioServiceAudioProcessing,WebRtcApmInAudioService",
     ]
     if rt["enabled"] and rt.get("bridge_info", {}).get("platform") == "linux":
         chrome_env["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
@@ -461,18 +469,93 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             # Pass PULSE_SOURCE via process env so Chrome inherits it.
             for k, v in chrome_env.items():
                 os.environ[k] = v
-            browser = pw.chromium.launch(
+
+            # Persistent browser profile — cookies survive across launches.
+            # On first launch (empty profile), we seed cookies from auth.json.
+            # After that, the profile stays authenticated permanently.
+            user_data_dir = out_dir.parent / "chrome_profile"
+            user_data_dir.mkdir(parents=True, exist_ok=True)
+            context = pw.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
                 headless=not headed,
                 args=chrome_args,
+                viewport={"width": 1280, "height": 800},
+                permissions=["microphone", "camera"],
             )
-            context_args = {
-                "viewport": {"width": 1280, "height": 800},
-                "permissions": ["microphone", "camera"],
-            }
-            if auth_state and Path(auth_state).is_file():
-                context_args["storage_state"] = auth_state
-            context = browser.new_context(**context_args)
             page = context.new_page()
+
+            # ── MeetBeats-style getUserMedia() override ──
+            # Kills echo cancellation, noise suppression, auto-gain, and
+            # Chrome-specific goog* audio processing.  Without this, Google
+            # Meet's "Studio sound" will classify TTS as non-speech noise and
+            # filter it out before it reaches other participants.
+            # NOTE: the goog* flags are Chrome-only and harmless no-ops on
+            # other platforms.  The standard echoCancellation:false is safe
+            # for Meet but may cause echo on Teams — gated by hostname check.
+            page.add_init_script("""
+                (() => {
+                  if (window.__hermesGUMOverridden) return;
+                  window.__hermesGUMOverridden = true;
+                  const orig = navigator.mediaDevices.getUserMedia.bind(
+                    navigator.mediaDevices
+                  );
+                  // Google Meet: disable all processing to let TTS through.
+                  // Non-Google platforms: keep standard echo cancellation.
+                  const isGoogleMeet = window.location.hostname.includes(
+                    'meet.google.com'
+                  );
+                  const noProcessing = isGoogleMeet ? {
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                    googEchoCancellation: false,
+                    googAutoGainControl: false,
+                    googNoiseSuppression: false,
+                    googHighpassFilter: false,
+                    googAudioMirroring: false,
+                  } : {
+                    // Keep echo cancellation for Teams/Zoom — disabling it
+                    // can cause echo loops on those platforms.
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                  };
+                  navigator.mediaDevices.getUserMedia = function (constraints) {
+                    if (constraints && typeof constraints.audio === 'object') {
+                      Object.assign(constraints.audio, noProcessing);
+                    } else if (constraints && constraints.audio === true) {
+                      constraints.audio = noProcessing;
+                    }
+                    return orig(constraints);
+                  };
+                  console.log('[Tess] getUserMedia override installed');
+                })();
+            """)
+
+            # ── Vexa FM-001 fix: framenavigated handler ──
+            # When a Google Meet ends naturally, Meet auto-navigates to its
+            # post-call page (/landing, "How was your call?", etc.) destroying
+            # the Playwright execution context. Without this handler, the bot
+            # misreports successful meetings as crashes (~25% false failure
+            # rate in Vexa prod).  We detect the post-call URL and exit
+            # gracefully with leave_reason="meeting_ended_via_navigation".
+            def _on_framenavigated(frame):
+                if frame != page.main_frame:
+                    return
+                url = frame.url
+                if any(marker in url for marker in (
+                    "/landing", "/_meet/", "meet.google.com/end",
+                )):
+                    state.set(leave_reason="meeting_ended_via_navigation")
+                    # VITAL: also set the stop flag so the drain loop exits
+                    # immediately.  Without this, the bot keeps polling the
+                    # post-call page until SIGTERM or page-closed timeout.
+                    stop_flag["stop"] = True
+                    print("[meet_bot] post-meeting navigation detected — "
+                          f"exiting gracefully: {url}", file=sys.stderr)
+
+            page.on("framenavigated", _on_framenavigated)
+
+            # ── end framenavigated handler ──
 
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -616,7 +699,6 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 pass
 
             context.close()
-            browser.close()
             # v2: teardown realtime speaker + pcm pump + audio bridge.
             if rt["speaker_stop"]:
                 try:
@@ -634,6 +716,12 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     rt["pcm_pump"].wait(timeout=3)
                 except Exception:
                     pass
+            # Remove the stale FIFO so the next session starts clean.
+            fifo = out_dir / "speaker.fifo"
+            try:
+                fifo.unlink(missing_ok=True)
+            except Exception:
+                pass
             if rt["session"]:
                 try:
                     rt["session"].close()
