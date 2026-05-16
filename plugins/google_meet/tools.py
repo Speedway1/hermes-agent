@@ -136,6 +136,15 @@ MEET_JOIN_SCHEMA: Dict[str, Any] = {
                     "approved via `hermes meet node approve`."
                 ),
             },
+            "auth_state": {
+                "type": "string",
+                "description": (
+                    "Optional path to Playwright auth state JSON file. When "
+                    "set, Chrome loads the stored Google session instead of "
+                    "joining as a guest. Defaults to "
+                    "~/.hermes/workspace/meetings/auth.json."
+                ),
+            },
         },
         "required": ["url"],
         "additionalProperties": False,
@@ -274,6 +283,7 @@ def handle_meet_join(args: Dict[str, Any], **_kw) -> str:
         guest_name=str(args.get("guest_name") or "Hermes Agent"),
         duration=str(args.get("duration")) if args.get("duration") else None,
         mode=mode,
+        auth_state=str(args.get("auth_state") or "").strip() or None,
     )
     return _json({"success": bool(res.get("ok")), **res})
 

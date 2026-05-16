@@ -156,12 +156,12 @@ def start(
         env["HERMES_MEET_REALTIME_KEY"] = realtime_api_key
 
     log_path = out / "bot.log"
-    # Detach: stdin=devnull, stdout/stderr → log file, new session so parent
-    # signals don't propagate.
     log_fh = open(log_path, "ab", buffering=0)
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "plugins.google_meet.meet_bot"],
+            [
+                sys.executable, "-m", "plugins.google_meet.meet_bot",
+            ],
             stdin=subprocess.DEVNULL,
             stdout=log_fh,
             stderr=subprocess.STDOUT,

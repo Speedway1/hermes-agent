@@ -35,7 +35,6 @@ import signal
 import sys
 import threading
 import time
-import base64
 from pathlib import Path
 from typing import Optional
 
@@ -52,7 +51,6 @@ MEET_URL_RE = re.compile(
 
 # Filenames the bot reads/writes in ``HERMES_MEET_OUT_DIR``.
 SAY_QUEUE_FILENAME = "say_queue.jsonl"
-SAY_WAV_FILENAME = "speaker.wav"
 
 
 def _is_safe_meet_url(url: str) -> bool:
@@ -245,84 +243,6 @@ _CAPTION_OBSERVER_JS = r"""
 """
 
 
-# JavaScript that injects generated WAV audio bytes into Meet's WebRTC sender
-# via the Web Audio API + replaceTrack() bypass. Called from the drain loop
-# when tess_client signals new audio is ready.
-_INJECT_AUDIO_FN_JS = r"""
-window.__hermesInjectAudioBytes = async (base64Wav) => {
-  try {
-    // 1. Decode the WAV bytes first.
-    const binaryStr = atob(base64Wav);
-    const len = binaryStr.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) bytes[i] = binaryStr.charCodeAt(i);
-    const ctx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 48000});
-    const audioBuffer = await ctx.decodeAudioData(bytes.buffer);
-
-    // 2. Find an audio sender BEFORE building the graph.
-    let audioSender = null;
-    let senderSource = 'none';
-    // Scan window keys for RTCPeerConnection objects.
-    for (const key of Object.keys(window)) {
-      try {
-        const val = window[key];
-        if (val && typeof val.getSenders === 'function') {
-          const senders = val.getSenders();
-          for (const sender of senders) {
-            if (sender.track && sender.track.kind === 'audio') {
-              audioSender = sender;
-              senderSource = key;
-              break;
-            }
-          }
-        }
-      } catch (e) {}
-      if (audioSender) break;
-    }
-    // Fallback: try pc0, pc1, etc.
-    if (!audioSender) {
-      for (let i = 0; i < 10; i++) {
-        const pc = window['pc' + i];
-        if (pc && typeof pc.getSenders === 'function') {
-          const senders = pc.getSenders();
-          for (const sender of senders) {
-            if (sender.track && sender.track.kind === 'audio') {
-              audioSender = sender;
-              senderSource = 'pc' + i;
-              break;
-            }
-          }
-        }
-        if (audioSender) break;
-      }
-    }
-    if (!audioSender) {
-      console.warn('[hermes] no audio sender found on any RTCPeerConnection');
-      return {found: false, reason: 'no_audio_sender'};
-    }
-
-    // 3. Build the audio graph.
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
-    const dest = ctx.createMediaStreamDestination();
-    source.connect(dest);
-
-    // 4. Replace track BEFORE starting playback (no race).
-    await audioSender.replaceTrack(dest.stream.getAudioTracks()[0]);
-    console.log('[hermes] audio track replaced on', senderSource);
-
-    // 5. NOW start playback.
-    source.start(0);
-    console.log('[hermes] audio playback started, duration', audioBuffer.duration.toFixed(1) + 's');
-    return {found: true, source: senderSource, duration_s: audioBuffer.duration};
-  } catch (e) {
-    console.error('[hermes] audio injection failed:', e);
-    return {found: false, error: String(e)};
-  }
-};
-"""
-
-
 def _enable_captions_js() -> str:
     """Return a small JS snippet that tries to click the 'Turn on captions' button.
 
@@ -348,12 +268,12 @@ def _start_realtime_speaker(
     stop_flag: dict,
     state: "_BotState",
 ) -> None:
-    """Wire up TessRealtimeSession + speaker thread (Groq → ElevenLabs → WAV).
+    """Wire up TessRealtimeSession + speaker thread + PCM pump (paplay).
 
     The speaker thread reads text lines from ``say_queue.jsonl``, sends each
-    to Groq → ElevenLabs Heather, and writes a 48kHz WAV into ``speaker.wav``.
-    Audio is injected into Meet's WebRTC sender via JS ``__hermesInjectAudioBytes``
-    (no OS audio devices needed).
+    to Groq → ElevenLabs Heather, and writes raw 24kHz s16le mono PCM into
+    ``speaker.pcm``. A separate pump process (paplay) streams that PCM into
+    the PulseAudio null-sink so Chrome's fake mic picks it up.
     """
     try:
         from plugins.google_meet.realtime.tess_client import (
@@ -364,20 +284,18 @@ def _start_realtime_speaker(
         state.set(error=f"tess_client import failed: {e}")
         return
 
-    wav_path = out_dir / SAY_WAV_FILENAME
+    pcm_path = out_dir / "speaker.pcm"
     queue_path = out_dir / SAY_QUEUE_FILENAME
     processed_path = out_dir / "say_processed.jsonl"
-    # Reset the sink file so we start clean each session.
-    wav_path.write_bytes(b"")
-    # Make sure the queue exists so the speaker poller doesn't error on
-    # first iteration.
+    pcm_path.write_bytes(b"")
     queue_path.touch()
 
     try:
         session = TessRealtimeSession(
-            audio_sink_path=wav_path,
+            audio_sink_path=pcm_path,
             sample_rate=24000,
         )
+        session.set_pcm_mode(True)
         session.connect()
     except Exception as e:
         state.set(error=f"realtime connect failed: {e}")
@@ -405,6 +323,29 @@ def _start_realtime_speaker(
     t_speaker = threading.Thread(target=_speaker_loop, name="meet-speaker", daemon=True)
     t_speaker.start()
     rt["speaker_thread"] = t_speaker
+
+    # PCM pump: paplay streams speaker.pcm (24kHz s16le mono) into
+    # the PulseAudio null-sink that Chrome's fake mic reads from.
+    import subprocess as _sp
+    sink = (rt.get("bridge_info") or {}).get("write_target") or "hermes_meet_sink"
+    try:
+        proc = _sp.Popen(
+            [
+                "paplay",
+                "--raw",
+                "--rate=24000",
+                "--format=s16le",
+                "--channels=1",
+                f"--device={sink}",
+                str(pcm_path),
+            ],
+            stdin=_sp.DEVNULL,
+            stdout=_sp.DEVNULL,
+            stderr=_sp.DEVNULL,
+        )
+        rt["pcm_pump"] = proc
+    except FileNotFoundError:
+        state.set(error="paplay not found — install pulseaudio-utils")
 
 
 def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
@@ -446,14 +387,17 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    # v2 realtime: Tess voice pipeline (Groq → ElevenLabs → Web Audio API).
-    # No OS audio devices needed — audio is injected via JS replaceTrack().
+    # v2 realtime: Tess voice pipeline (Groq → ElevenLabs → PCM → paplay → PulseAudio).
+    # Chrome reads from null-sink virtual source via PULSE_SOURCE.
     rt = {
         "enabled": mode == "realtime",
+        "bridge": None,            # AudioBridge | None
+        "bridge_info": None,       # dict | None
         "session": None,           # TessRealtimeSession | None
         "speaker_thread": None,    # threading.Thread | None
         "speaker_stop": None,      # callable | None
-        "_post_admit_done": False, # whether post-admission JS has been installed
+        "pcm_pump": None,          # subprocess.Popen | None
+        "_post_admit_done": False, # whether post-admission setup ran
     }
     if rt["enabled"]:
         # Detect Groq + ElevenLabs keys from .env file.
@@ -469,9 +413,17 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     elif line.startswith("ELEVENLABS_API_KEY=") and not line.startswith("#"):
                         elevenlabs_key_found = True
         if groq_key_found and elevenlabs_key_found:
-            state.set(realtime=True)
+            try:
+                from plugins.google_meet.audio_bridge import AudioBridge
+                bridge = AudioBridge()
+                rt["bridge_info"] = bridge.setup()
+                rt["bridge"] = bridge
+                state.set(realtime=True, realtime_device=rt["bridge_info"].get("device_name"))
+            except Exception as e:
+                state.set(error=f"audio bridge setup failed: {e} — falling back to transcribe")
+                rt["enabled"] = False
         else:
-            state.set(error="realtime mode requested but GROQ_API_KEY + ELEVENLABS_API_KEY not found in .env — falling back to transcribe")
+            state.set(error="realtime mode requested but API keys not found — falling back to transcribe")
             rt["enabled"] = False
 
     try:
@@ -484,16 +436,16 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
         )
         return 3
 
-    # Chrome args: EXACTLY match the working diagnostic script.
-    # Seed a silence WAV so Chrome's fake device has something to play.
+    # Chrome args: fake UI + fake device. Silence WAV SEEDS the fake device
+    # so Meet's initial getUserMedia doesn't break (required for JOINING).
+    # PulseAudio PULSE_SOURCE provides actual audio once connected.
     wav_path = out_dir / "speaker.wav"
-    wav_path.parent.mkdir(parents=True, exist_ok=True)
     import wave as _wv
     with open(wav_path, "wb") as f:
         with _wv.open(f, "wb") as wf:
             wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(48000)
             wf.writeframes(b'\x00' * (48000 * 5 * 2))  # 5s silence
-
+    chrome_env = os.environ.copy()
     chrome_args = [
         "--use-fake-ui-for-media-stream",
         "--use-fake-device-for-media-stream",
@@ -501,9 +453,14 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
     ]
+    if rt["enabled"] and rt.get("bridge_info", {}).get("platform") == "linux":
+        chrome_env["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
 
     try:
         with sync_playwright() as pw:
+            # Pass PULSE_SOURCE via process env so Chrome inherits it.
+            for k, v in chrome_env.items():
+                os.environ[k] = v
             browser = pw.chromium.launch(
                 headless=not headed,
                 args=chrome_args,
@@ -546,7 +503,6 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             #   * draining scraped captions into the transcript
             #   * triggering realtime barge-in when a human speaks while
             #     the bot is generating audio
-            #   * injecting audio WAV bytes via __hermesInjectAudioBytes
             #   * periodically flushing realtime counters into status.json
             deadline = (time.time() + duration_s) if duration_s else None
             lobby_deadline = time.time() + float(
@@ -582,11 +538,6 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                                 page.evaluate(_CAPTION_OBSERVER_JS)
                             except Exception as e:
                                 state.set(error=f"caption observer install failed: {e}")
-                            # Install audio injection JS
-                            try:
-                                page.evaluate(_INJECT_AUDIO_FN_JS)
-                            except Exception as e:
-                                state.set(error=f"audio injection JS install failed: {e}")
                             # Start realtime speaker if enabled
                             if rt["enabled"]:
                                 _start_realtime_speaker(
@@ -645,24 +596,6 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             state.set(leave_reason="page_closed")
                             break
 
-                # Audio injection: check if tess_client has new audio ready.
-                if state.in_call and rt["session"] is not None:
-                    try:
-                        session = rt["session"]
-                        if getattr(session, "_audio_ready", False):
-                            wav_path = out_dir / SAY_WAV_FILENAME
-                            if wav_path.exists():
-                                wav_bytes = wav_path.read_bytes()
-                                b64 = base64.b64encode(wav_bytes).decode("ascii")
-                                result = page.evaluate(
-                                    "(b64) => window.__hermesInjectAudioBytes && window.__hermesInjectAudioBytes(b64)",
-                                    b64,
-                                )
-                                state.set(last_injection_result=result)
-                                session._audio_ready = False
-                    except Exception:
-                        pass
-
                 # Fold the realtime session's byte/timestamp counters into
                 # the status file so meet_status can surface them.
                 if rt["session"] is not None:
@@ -684,7 +617,7 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
 
             context.close()
             browser.close()
-            # v2: teardown realtime speaker.
+            # v2: teardown realtime speaker + pcm pump + audio bridge.
             if rt["speaker_stop"]:
                 try:
                     rt["speaker_stop"]()
@@ -695,9 +628,20 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     rt["speaker_thread"].join(timeout=5.0)
                 except Exception:
                     pass
+            if rt["pcm_pump"]:
+                try:
+                    rt["pcm_pump"].terminate()
+                    rt["pcm_pump"].wait(timeout=3)
+                except Exception:
+                    pass
             if rt["session"]:
                 try:
                     rt["session"].close()
+                except Exception:
+                    pass
+            if rt["bridge"]:
+                try:
+                    rt["bridge"].teardown()
                 except Exception:
                     pass
             state.set(in_call=False, captioning=False, exited=True)
@@ -815,18 +759,23 @@ def _click_join(page, state: _BotState) -> None:
 
     Flags ``lobby_waiting`` when we hit the "waiting for host to admit you"
     state so the agent can surface that in status.
+    
+    Uses standard click with timeout (NO no_wait_after) — exactly matching
+    the working diagnostic script. Playwright waits for the page transition
+    to complete before returning, so the DOM is settled when the drain loop
+    starts checking admission.
     """
     for label in ("Join now", "Ask to join"):
         try:
             btn = page.get_by_role("button", name=label, exact=False).first
             if btn.count() and btn.is_visible():
-                btn.click(timeout=10_000, no_wait_after=True)
+                btn.click(timeout=3_000)
                 if label == "Ask to join":
                     state.set(lobby_waiting=True)
                 break
         except Exception:
             continue
-    time.sleep(1)
+    time.sleep(2)
 
 
 def _parse_duration(raw: str) -> Optional[float]:
