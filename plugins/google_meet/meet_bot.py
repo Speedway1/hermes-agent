@@ -35,6 +35,7 @@ import signal
 import sys
 import threading
 import time
+import base64
 from pathlib import Path
 from typing import Optional
 
@@ -51,7 +52,7 @@ MEET_URL_RE = re.compile(
 
 # Filenames the bot reads/writes in ``HERMES_MEET_OUT_DIR``.
 SAY_QUEUE_FILENAME = "say_queue.jsonl"
-SAY_PCM_FILENAME = "speaker.pcm"
+SAY_WAV_FILENAME = "speaker.wav"
 
 
 def _is_safe_meet_url(url: str) -> bool:
@@ -244,6 +245,84 @@ _CAPTION_OBSERVER_JS = r"""
 """
 
 
+# JavaScript that injects generated WAV audio bytes into Meet's WebRTC sender
+# via the Web Audio API + replaceTrack() bypass. Called from the drain loop
+# when tess_client signals new audio is ready.
+_INJECT_AUDIO_FN_JS = r"""
+window.__hermesInjectAudioBytes = async (base64Wav) => {
+  try {
+    // 1. Decode the WAV bytes first.
+    const binaryStr = atob(base64Wav);
+    const len = binaryStr.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binaryStr.charCodeAt(i);
+    const ctx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 48000});
+    const audioBuffer = await ctx.decodeAudioData(bytes.buffer);
+
+    // 2. Find an audio sender BEFORE building the graph.
+    let audioSender = null;
+    let senderSource = 'none';
+    // Scan window keys for RTCPeerConnection objects.
+    for (const key of Object.keys(window)) {
+      try {
+        const val = window[key];
+        if (val && typeof val.getSenders === 'function') {
+          const senders = val.getSenders();
+          for (const sender of senders) {
+            if (sender.track && sender.track.kind === 'audio') {
+              audioSender = sender;
+              senderSource = key;
+              break;
+            }
+          }
+        }
+      } catch (e) {}
+      if (audioSender) break;
+    }
+    // Fallback: try pc0, pc1, etc.
+    if (!audioSender) {
+      for (let i = 0; i < 10; i++) {
+        const pc = window['pc' + i];
+        if (pc && typeof pc.getSenders === 'function') {
+          const senders = pc.getSenders();
+          for (const sender of senders) {
+            if (sender.track && sender.track.kind === 'audio') {
+              audioSender = sender;
+              senderSource = 'pc' + i;
+              break;
+            }
+          }
+        }
+        if (audioSender) break;
+      }
+    }
+    if (!audioSender) {
+      console.warn('[hermes] no audio sender found on any RTCPeerConnection');
+      return {found: false, reason: 'no_audio_sender'};
+    }
+
+    // 3. Build the audio graph.
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    const dest = ctx.createMediaStreamDestination();
+    source.connect(dest);
+
+    // 4. Replace track BEFORE starting playback (no race).
+    await audioSender.replaceTrack(dest.stream.getAudioTracks()[0]);
+    console.log('[hermes] audio track replaced on', senderSource);
+
+    // 5. NOW start playback.
+    source.start(0);
+    console.log('[hermes] audio playback started, duration', audioBuffer.duration.toFixed(1) + 's');
+    return {found: true, source: senderSource, duration_s: audioBuffer.duration};
+  } catch (e) {
+    console.error('[hermes] audio injection failed:', e);
+    return {found: false, error: String(e)};
+  }
+};
+"""
+
+
 def _enable_captions_js() -> str:
     """Return a small JS snippet that tries to click the 'Turn on captions' button.
 
@@ -266,48 +345,37 @@ def _start_realtime_speaker(
     *,
     rt: dict,
     out_dir: Path,
-    bridge_info: dict,
-    api_key: str,
-    model: str,
-    voice: str,
-    instructions: str,
     stop_flag: dict,
     state: "_BotState",
 ) -> None:
-    """Wire up the OpenAI Realtime session + speaker thread + PCM pump.
+    """Wire up TessRealtimeSession + speaker thread (Groq → ElevenLabs → WAV).
 
     The speaker thread reads text lines from ``say_queue.jsonl``, sends each
-    to OpenAI Realtime, and writes PCM audio into ``speaker.pcm``. A
-    separate *pump* thread forwards that PCM into the OS audio sink so
-    Chrome's fake mic picks it up. On Linux we pipe to ``paplay`` against
-    the null-sink; on macOS the caller is expected to have the BlackHole
-    device selected as default input.
+    to Groq → ElevenLabs Heather, and writes a 48kHz WAV into ``speaker.wav``.
+    Audio is injected into Meet's WebRTC sender via JS ``__hermesInjectAudioBytes``
+    (no OS audio devices needed).
     """
     try:
-        from plugins.google_meet.realtime.openai_client import (
-            RealtimeSession,
-            RealtimeSpeaker,
+        from plugins.google_meet.realtime.tess_client import (
+            TessRealtimeSession,
+            TessRealtimeSpeaker,
         )
     except Exception as e:
-        state.set(error=f"realtime import failed: {e}")
+        state.set(error=f"tess_client import failed: {e}")
         return
 
-    pcm_path = out_dir / SAY_PCM_FILENAME
+    wav_path = out_dir / SAY_WAV_FILENAME
     queue_path = out_dir / SAY_QUEUE_FILENAME
     processed_path = out_dir / "say_processed.jsonl"
     # Reset the sink file so we start clean each session.
-    pcm_path.write_bytes(b"")
+    wav_path.write_bytes(b"")
     # Make sure the queue exists so the speaker poller doesn't error on
     # first iteration.
     queue_path.touch()
 
     try:
-        session = RealtimeSession(
-            api_key=api_key,
-            model=model,
-            voice=voice,
-            instructions=instructions,
-            audio_sink_path=pcm_path,
+        session = TessRealtimeSession(
+            audio_sink_path=wav_path,
             sample_rate=24000,
         )
         session.connect()
@@ -322,7 +390,7 @@ def _start_realtime_speaker(
 
     rt["speaker_stop"] = lambda: stop_flag.__setitem__("stop", stop_flag.get("stop", False))
 
-    speaker = RealtimeSpeaker(
+    speaker = TessRealtimeSpeaker(
         session=session,
         queue_path=queue_path,
         processed_path=processed_path,
@@ -337,111 +405,6 @@ def _start_realtime_speaker(
     t_speaker = threading.Thread(target=_speaker_loop, name="meet-speaker", daemon=True)
     t_speaker.start()
     rt["speaker_thread"] = t_speaker
-
-    # PCM pump: feeds speaker.pcm (24kHz s16le mono) into the OS audio
-    # device that Chrome's fake mic reads from. Different tools per
-    # platform, but the contract is the same — block-read the growing
-    # PCM file and stream it to the device in near-real-time.
-    platform_tag = (bridge_info or {}).get("platform")
-    if platform_tag == "linux":
-        import subprocess as _sp
-
-        sink = (bridge_info or {}).get("write_target") or "hermes_meet_sink"
-        try:
-            proc = _sp.Popen(
-                [
-                    "paplay",
-                    "--raw",
-                    "--rate=24000",
-                    "--format=s16le",
-                    "--channels=1",
-                    f"--device={sink}",
-                    str(pcm_path),
-                ],
-                stdin=_sp.DEVNULL,
-                stdout=_sp.DEVNULL,
-                stderr=_sp.DEVNULL,
-            )
-            rt["pcm_pump"] = proc
-        except FileNotFoundError:
-            state.set(error="paplay not found — install pulseaudio-utils for realtime on Linux")
-    elif platform_tag == "darwin":
-        # macOS: use ffmpeg to tail-read speaker.pcm and write it to the
-        # BlackHole output device. The user must have BlackHole selected
-        # as the default input in System Settings → Sound for Chrome to
-        # pick it up. We prefer ffmpeg because it's scriptable and can
-        # target AVFoundation devices by name; fall back to afplay-ing
-        # the file in a tight loop if ffmpeg is absent.
-        import shutil as _shutil
-        import subprocess as _sp
-
-        device_name = (bridge_info or {}).get("write_target") or "BlackHole 2ch"
-        if _shutil.which("ffmpeg"):
-            try:
-                # -re: read input at native frame rate.
-                # -f avfoundation -i: speaker path as raw PCM.
-                # -f s16le -ar 24000 -ac 1 -i <pcm>: interpret the file.
-                # -f audiotoolbox -audio_device_index: write to BlackHole.
-                # Simpler: output as raw via coreaudio using "-f audiotoolbox".
-                # ffmpeg's audiotoolbox output picks the current default
-                # output device, which isn't what we want. Instead we use
-                # -f avfoundation with the named device as OUTPUT via
-                # -vn and the device name.
-                proc = _sp.Popen(
-                    [
-                        "ffmpeg",
-                        "-nostdin", "-hide_banner", "-loglevel", "error",
-                        "-re",
-                        "-f", "s16le", "-ar", "24000", "-ac", "1",
-                        "-i", str(pcm_path),
-                        "-f", "audiotoolbox",
-                        "-audio_device_index", _mac_audio_device_index(device_name),
-                        "-",
-                    ],
-                    stdin=_sp.DEVNULL,
-                    stdout=_sp.DEVNULL,
-                    stderr=_sp.DEVNULL,
-                )
-                rt["pcm_pump"] = proc
-            except FileNotFoundError:
-                state.set(error="ffmpeg not found — install via `brew install ffmpeg` for realtime on macOS")
-            except Exception as e:
-                state.set(error=f"macOS pcm pump failed to start: {e}")
-        else:
-            state.set(error="ffmpeg not found — install via `brew install ffmpeg` for realtime on macOS")
-
-
-def _mac_audio_device_index(device_name: str) -> str:
-    """Return the ffmpeg ``-audio_device_index`` for *device_name*, as a string.
-
-    Probes ``ffmpeg -f avfoundation -list_devices true -i ''`` (which prints
-    the device table on stderr) and matches *device_name* case-insensitively.
-    Defaults to ``"0"`` if the device can't be found — caller will get a
-    misrouted stream but not a crash, and the error will be obvious.
-    """
-    import subprocess as _sp
-
-    try:
-        out = _sp.run(
-            ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except Exception:
-        return "0"
-    # ffmpeg prints the table on stderr. Lines look like:
-    #   [AVFoundation indev @ 0x...] [0] BlackHole 2ch
-    import re as _re
-
-    needle = device_name.strip().lower()
-    for line in (out.stderr or "").splitlines():
-        m = _re.search(r"\[(\d+)\]\s+(.+)$", line)
-        if not m:
-            continue
-        if m.group(2).strip().lower() == needle:
-            return m.group(1)
-    return "0"
 
 
 def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
@@ -483,32 +446,33 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    # v2 realtime: provision virtual audio device + start speaker thread.
-    # We track these in a dict so the finally block can tear them down
-    # regardless of how we exit. If anything in the realtime setup fails we
-    # fall back to transcribe mode with a status flag.
+    # v2 realtime: Tess voice pipeline (Groq → ElevenLabs → Web Audio API).
+    # No OS audio devices needed — audio is injected via JS replaceTrack().
     rt = {
         "enabled": mode == "realtime",
-        "bridge": None,            # AudioBridge | None
-        "bridge_info": None,       # dict | None
-        "session": None,           # RealtimeSession | None
+        "session": None,           # TessRealtimeSession | None
         "speaker_thread": None,    # threading.Thread | None
         "speaker_stop": None,      # callable | None
+        "_post_admit_done": False, # whether post-admission JS has been installed
     }
     if rt["enabled"]:
-        if not realtime_api_key:
-            state.set(error="realtime mode requested but no API key in HERMES_MEET_REALTIME_KEY/OPENAI_API_KEY — falling back to transcribe")
-            rt["enabled"] = False
+        # Detect Groq + ElevenLabs keys from .env file.
+        env_path = Path(os.environ.get("HERMES_ENV_FILE", "~/.hermes/.env")).expanduser()
+        groq_key_found = False
+        elevenlabs_key_found = False
+        if env_path.exists():
+            with open(env_path) as ef:
+                for line in ef:
+                    line = line.strip()
+                    if line.startswith("GROQ_API_KEY=") and not line.startswith("#"):
+                        groq_key_found = True
+                    elif line.startswith("ELEVENLABS_API_KEY=") and not line.startswith("#"):
+                        elevenlabs_key_found = True
+        if groq_key_found and elevenlabs_key_found:
+            state.set(realtime=True)
         else:
-            try:
-                from plugins.google_meet.audio_bridge import AudioBridge
-                bridge = AudioBridge()
-                rt["bridge_info"] = bridge.setup()
-                rt["bridge"] = bridge
-                state.set(realtime=True, realtime_device=rt["bridge_info"].get("device_name"))
-            except Exception as e:
-                state.set(error=f"audio bridge setup failed: {e} — falling back to transcribe")
-                rt["enabled"] = False
+            state.set(error="realtime mode requested but GROQ_API_KEY + ELEVENLABS_API_KEY not found in .env — falling back to transcribe")
+            rt["enabled"] = False
 
     try:
         from playwright.sync_api import sync_playwright
@@ -518,40 +482,34 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             "google_meet bot: playwright is not installed. Run "
             "`pip install playwright && python -m playwright install chromium`\n"
         )
-        if rt["bridge"]:
-            rt["bridge"].teardown()
         return 3
 
-    # Chrome env: if realtime is live on Linux, point PULSE_SOURCE at the
-    # virtual source so Chrome's fake mic reads the audio we generate.
-    chrome_env = os.environ.copy()
+    # Chrome args: EXACTLY match the working diagnostic script.
+    # Seed a silence WAV so Chrome's fake device has something to play.
+    wav_path = out_dir / "speaker.wav"
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    import wave as _wv
+    with open(wav_path, "wb") as f:
+        with _wv.open(f, "wb") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(48000)
+            wf.writeframes(b'\x00' * (48000 * 5 * 2))  # 5s silence
+
     chrome_args = [
         "--use-fake-ui-for-media-stream",
+        "--use-fake-device-for-media-stream",
+        f"--use-file-for-fake-audio-capture={wav_path}",
         "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
     ]
-    if not rt["enabled"]:
-        # v1-style fake device (silence) — we don't care about mic content
-        # when we're not speaking.
-        chrome_args.insert(1, "--use-fake-device-for-media-stream")
-    elif rt["bridge_info"] and rt["bridge_info"].get("platform") == "linux":
-        chrome_env["PULSE_SOURCE"] = rt["bridge_info"].get("device_name", "")
 
     try:
         with sync_playwright() as pw:
-            # Playwright's launch() doesn't take env; we set PULSE_SOURCE
-            # via the process env before launch so the child Chrome inherits it.
-            for k, v in chrome_env.items():
-                os.environ[k] = v
             browser = pw.chromium.launch(
                 headless=not headed,
                 args=chrome_args,
             )
             context_args = {
                 "viewport": {"width": 1280, "height": 800},
-                "user_agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
                 "permissions": ["microphone", "camera"],
             }
             if auth_state and Path(auth_state).is_file():
@@ -570,49 +528,25 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             _try_guest_name(page, guest_name)
             _click_join(page, state)
 
-            # Install caption observer and attempt to enable captions.
-            try:
-                page.evaluate(_enable_captions_js())
-                state.set(captions_enabled_attempted=True)
-            except Exception:
-                pass
-            try:
-                page.evaluate(_CAPTION_OBSERVER_JS)
-            except Exception as e:
-                state.set(error=f"caption observer install failed: {e}")
-
+            # Record join attempt time and enter drain loop IMMEDIATELY.
+            # NO JavaScript is injected yet — that only happens AFTER
+            # _detect_admission() confirms we're past the lobby.
+            state.set(join_attempted_at=time.time())
             # Note: in_call=False until admission is confirmed (we detect
             # either the Leave button or the caption region, signalling we
-            # made it past the lobby).
-            state.set(captioning=True, join_attempted_at=time.time())
-
-            # v2 realtime: start the speaker thread reading from the
-            # plugin-side say queue. The thread reads JSONL lines written by
-            # meet_say, calls OpenAI Realtime, and streams the audio PCM to
-            # the virtual sink that Chrome's fake-mic is pointed at.
-            if rt["enabled"]:
-                _start_realtime_speaker(
-                    rt=rt,
-                    out_dir=out_dir,
-                    bridge_info=rt["bridge_info"],
-                    api_key=realtime_api_key,
-                    model=realtime_model,
-                    voice=realtime_voice,
-                    instructions=realtime_instructions,
-                    stop_flag=stop_flag,
-                    state=state,
-                )
-                if rt["session"] is not None:
-                    state.set(realtime_ready=True)
+            # made it past the lobby). DO NOT set captioning=True yet.
 
             # Admission + drain loop. Runs until SIGTERM, duration expiry,
             # or the page detects "You were removed / you left the
             # meeting". Responsible for:
             #   * detecting admission (Leave button visible → in_call=True)
+            #   * ONCE admitted: installing captions + audio injection JS,
+            #     starting the realtime speaker
             #   * timing out stuck-in-lobby (default 5 minutes)
             #   * draining scraped captions into the transcript
             #   * triggering realtime barge-in when a human speaks while
             #     the bot is generating audio
+            #   * injecting audio WAV bytes via __hermesInjectAudioBytes
             #   * periodically flushing realtime counters into status.json
             deadline = (time.time() + duration_s) if duration_s else None
             lobby_deadline = time.time() + float(
@@ -635,6 +569,37 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             lobby_waiting=False,
                             joined_at=now,
                         )
+                        # ----- POST-ADMISSION SETUP (runs ONCE) -----
+                        if not rt["_post_admit_done"]:
+                            rt["_post_admit_done"] = True
+                            # Install captions + observer JS
+                            try:
+                                page.evaluate(_enable_captions_js())
+                                state.set(captions_enabled_attempted=True)
+                            except Exception:
+                                pass
+                            try:
+                                page.evaluate(_CAPTION_OBSERVER_JS)
+                            except Exception as e:
+                                state.set(error=f"caption observer install failed: {e}")
+                            # Install audio injection JS
+                            try:
+                                page.evaluate(_INJECT_AUDIO_FN_JS)
+                            except Exception as e:
+                                state.set(error=f"audio injection JS install failed: {e}")
+                            # Start realtime speaker if enabled
+                            if rt["enabled"]:
+                                _start_realtime_speaker(
+                                    rt=rt,
+                                    out_dir=out_dir,
+                                    stop_flag=stop_flag,
+                                    state=state,
+                                )
+                                if rt["session"] is not None:
+                                    state.set(realtime_ready=True)
+                            state.set(captioning=True)
+                            print("[meet_bot] post-admission setup complete")
+                        # ---- END POST-ADMISSION SETUP ----
                     elif now > lobby_deadline:
                         state.set(
                             error=(
@@ -644,39 +609,59 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                             leave_reason="lobby_timeout",
                         )
                         break
-                    elif _detect_denied(page):
+                    elif _detect_denied(page, state, out_dir):
                         state.set(
                             error="host denied admission",
                             leave_reason="denied",
                         )
                         break
 
-                try:
-                    queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
-                    if isinstance(queued, list):
-                        for entry in queued:
-                            if not isinstance(entry, dict):
-                                continue
-                            speaker = str(entry.get("speaker", ""))
-                            text = str(entry.get("text", ""))
-                            state.record_caption(speaker=speaker, text=text)
-                            # Barge-in: if the bot is currently generating
-                            # audio AND a real human just spoke, cancel the
-                            # in-flight response so we don't talk over them.
-                            if rt["enabled"] and rt["session"] is not None:
-                                if _looks_like_human_speaker(speaker, guest_name):
-                                    try:
-                                        cancelled = rt["session"].cancel_response()
-                                        if cancelled:
-                                            state.set(last_barge_in_at=now)
-                                    except Exception:
-                                        pass
-                except Exception:
-                    # Meet reloaded or we got booted — try to detect and
-                    # exit gracefully rather than spinning.
-                    if page.is_closed():
-                        state.set(leave_reason="page_closed")
-                        break
+                # Drain captions (only works after JS is installed).
+                if state.in_call:
+                    try:
+                        queued = page.evaluate("window.__hermesMeetDrain && window.__hermesMeetDrain()")
+                        if isinstance(queued, list):
+                            for entry in queued:
+                                if not isinstance(entry, dict):
+                                    continue
+                                speaker = str(entry.get("speaker", ""))
+                                text = str(entry.get("text", ""))
+                                state.record_caption(speaker=speaker, text=text)
+                                # Barge-in: if the bot is currently generating
+                                # audio AND a real human just spoke, cancel the
+                                # in-flight response so we don't talk over them.
+                                if rt["enabled"] and rt["session"] is not None:
+                                    if _looks_like_human_speaker(speaker, guest_name):
+                                        try:
+                                            cancelled = rt["session"].cancel_response()
+                                            if cancelled:
+                                                state.set(last_barge_in_at=now)
+                                        except Exception:
+                                            pass
+                    except Exception:
+                        # Meet reloaded or we got booted — try to detect and
+                        # exit gracefully rather than spinning.
+                        if page.is_closed():
+                            state.set(leave_reason="page_closed")
+                            break
+
+                # Audio injection: check if tess_client has new audio ready.
+                if state.in_call and rt["session"] is not None:
+                    try:
+                        session = rt["session"]
+                        if getattr(session, "_audio_ready", False):
+                            wav_path = out_dir / SAY_WAV_FILENAME
+                            if wav_path.exists():
+                                wav_bytes = wav_path.read_bytes()
+                                b64 = base64.b64encode(wav_bytes).decode("ascii")
+                                result = page.evaluate(
+                                    "(b64) => window.__hermesInjectAudioBytes && window.__hermesInjectAudioBytes(b64)",
+                                    b64,
+                                )
+                                state.set(last_injection_result=result)
+                                session._audio_ready = False
+                    except Exception:
+                        pass
 
                 # Fold the realtime session's byte/timestamp counters into
                 # the status file so meet_status can surface them.
@@ -699,7 +684,7 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
 
             context.close()
             browser.close()
-            # v2: teardown realtime speaker + audio bridge.
+            # v2: teardown realtime speaker.
             if rt["speaker_stop"]:
                 try:
                     rt["speaker_stop"]()
@@ -713,11 +698,6 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             if rt["session"]:
                 try:
                     rt["session"].close()
-                except Exception:
-                    pass
-            if rt["bridge"]:
-                try:
-                    rt["bridge"].teardown()
                 except Exception:
                     pass
             state.set(in_call=False, captioning=False, exited=True)
@@ -774,8 +754,18 @@ def _detect_admission(page) -> bool:
         return False
 
 
-def _detect_denied(page) -> bool:
-    """True when Meet is showing a 'you were denied' / 'no one admitted' page."""
+def _detect_denied(page, state: _BotState = None, out_dir: Path = None) -> bool:
+    """True when Meet is showing a 'you were denied' / 'no one admitted' page.
+
+    Includes an 8-second grace period after join_attempted_at to avoid
+    false positives during the page transition. Captures a debug screenshot
+    on denial for root-cause analysis.
+    """
+    # Grace period: refuse to check during the first 8 seconds after join.
+    if state is not None and state.join_attempted_at is not None:
+        if time.time() - state.join_attempted_at < 8.0:
+            return False
+
     probe = r"""
     (() => {
       const text = document.body ? document.body.innerText || '' : '';
@@ -788,7 +778,14 @@ def _detect_denied(page) -> bool:
     })();
     """
     try:
-        return bool(page.evaluate(probe))
+        result = bool(page.evaluate(probe))
+        if result and out_dir is not None:
+            # Capture debug screenshot on denial.
+            try:
+                page.screenshot(path=str(out_dir / "denial_debug.png"))
+            except Exception:
+                pass
+        return result
     except Exception:
         return False
 
@@ -823,12 +820,13 @@ def _click_join(page, state: _BotState) -> None:
         try:
             btn = page.get_by_role("button", name=label, exact=False).first
             if btn.count() and btn.is_visible():
-                btn.click(timeout=3_000)
+                btn.click(timeout=10_000, no_wait_after=True)
                 if label == "Ask to join":
                     state.set(lobby_waiting=True)
                 break
         except Exception:
             continue
+    time.sleep(1)
 
 
 def _parse_duration(raw: str) -> Optional[float]:
