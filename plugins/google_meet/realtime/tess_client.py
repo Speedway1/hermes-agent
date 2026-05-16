@@ -138,12 +138,16 @@ class TessRealtimeSession:
         instructions: str = "",   # injected into Groq system prompt
         audio_sink_path: Optional[Path] = None,
         sample_rate: int = SAMPLE_RATE,
+        pulse_sink_name: str = "tess_mic_sink",
+        pulse_source_name: str = "tess_mic_src",
     ) -> None:
         self.model = model
         self.voice = voice
         self.instructions = instructions
         self.audio_sink_path = Path(audio_sink_path) if audio_sink_path else None
         self.sample_rate = sample_rate
+        self.pulse_sink_name = pulse_sink_name
+        self.pulse_source_name = pulse_source_name
         self._write_lock = threading.Lock()
         # Public counters (read by meet_bot.py drain loop via getattr)
         self.audio_bytes_out: int = 0
@@ -242,7 +246,7 @@ class TessRealtimeSession:
                 # Unmute PulseAudio before writing audio (modelled on Vexa's
                 # TTSPlaybackService).  Muted in the finally block below so
                 # we never leave the mic open on a write failure.
-                _unmute_pulseaudio()
+                _unmute_pulseaudio(self.pulse_sink_name, self.pulse_source_name)
                 try:
                     self.audio_sink_path.parent.mkdir(parents=True, exist_ok=True)
                     if self._fifo_mode:
@@ -283,7 +287,7 @@ class TessRealtimeSession:
                 finally:
                     # ALWAYS re-mute — prevents ambient audio leaking into
                     # the meeting if the write fails mid-speech.
-                    _mute_pulseaudio()
+                    _mute_pulseaudio(self.pulse_sink_name, self.pulse_source_name)
 
         duration_ms = (time.monotonic() - start) * 1000.0
         return {

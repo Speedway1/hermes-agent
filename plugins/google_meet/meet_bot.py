@@ -300,6 +300,8 @@ def _start_realtime_speaker(
         session = TessRealtimeSession(
             audio_sink_path=fifo_path,
             sample_rate=24000,
+            pulse_sink_name=(rt.get("bridge_info") or {}).get("write_target", "tess_mic_sink"),
+            pulse_source_name=(rt.get("bridge_info") or {}).get("device_name", "tess_mic_src"),
         )
         session.set_fifo_mode(True)
         session.connect()
@@ -531,13 +533,20 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 })();
             """)
 
+
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            except Exception as e:
+                state.set(error=f"navigate failed: {e}", exited=True)
+                return 4
+
             # ── Vexa FM-001 fix: framenavigated handler ──
-            # When a Google Meet ends naturally, Meet auto-navigates to its
-            # post-call page (/landing, "How was your call?", etc.) destroying
-            # the Playwright execution context. Without this handler, the bot
-            # misreports successful meetings as crashes (~25% false failure
-            # rate in Vexa prod).  We detect the post-call URL and exit
-            # gracefully with leave_reason="meeting_ended_via_navigation".
+            # Registered AFTER initial navigation to avoid false-triggering
+            # on the page.goto() itself.  When a Google Meet ends naturally,
+            # Meet auto-navigates to its post-call page (/landing, "How was
+            # your call?", etc.) destroying the Playwright execution context.
+            # Without this handler, the bot misreports successful meetings as
+            # crashes (~25% false failure rate in Vexa prod).
             def _on_framenavigated(frame):
                 if frame != page.main_frame:
                     return
@@ -546,9 +555,6 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                     "/landing", "/_meet/", "meet.google.com/end",
                 )):
                     state.set(leave_reason="meeting_ended_via_navigation")
-                    # VITAL: also set the stop flag so the drain loop exits
-                    # immediately.  Without this, the bot keeps polling the
-                    # post-call page until SIGTERM or page-closed timeout.
                     stop_flag["stop"] = True
                     print("[meet_bot] post-meeting navigation detected — "
                           f"exiting gracefully: {url}", file=sys.stderr)
@@ -556,12 +562,6 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             page.on("framenavigated", _on_framenavigated)
 
             # ── end framenavigated handler ──
-
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            except Exception as e:
-                state.set(error=f"navigate failed: {e}", exited=True)
-                return 4
 
             # Guest-mode: Meet shows a name field before "Ask to join". When
             # we're authed, we instead see "Join now".
