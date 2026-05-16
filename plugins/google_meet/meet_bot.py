@@ -472,18 +472,26 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
             for k, v in chrome_env.items():
                 os.environ[k] = v
 
-            # Persistent browser profile — cookies survive across launches.
-            # On first launch (empty profile), we seed cookies from auth.json.
-            # After that, the profile stays authenticated permanently.
-            user_data_dir = out_dir.parent / "chrome_profile"
-            user_data_dir.mkdir(parents=True, exist_ok=True)
-            context = pw.chromium.launch_persistent_context(
-                user_data_dir=str(user_data_dir),
+            # Standard launch + storageState — the proven approach used by
+            # recallai and our diagnostic script.  Cookies from auth.json are
+            # loaded into a regular context.  auth.json must be fresh
+            # (generated within the last few minutes by `hermes meet auth`).
+            browser = pw.chromium.launch(
                 headless=not headed,
                 args=chrome_args,
-                viewport={"width": 1280, "height": 800},
-                permissions=["microphone", "camera"],
             )
+            context_options = {
+                "viewport": {"width": 1280, "height": 800},
+                "permissions": ["microphone", "camera"],
+                "user_agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+                ),
+            }
+            auth_json = out_dir.parent / "auth.json"
+            if auth_json.exists():
+                context_options["storage_state"] = str(auth_json)
+            context = browser.new_context(**context_options)
             page = context.new_page()
 
             # ── MeetBeats-style getUserMedia() override ──
@@ -699,6 +707,10 @@ def run_bot() -> int:  # noqa: C901 — orchestration, explicit branches
                 pass
 
             context.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
             # v2: teardown realtime speaker + pcm pump + audio bridge.
             if rt["speaker_stop"]:
                 try:
@@ -848,12 +860,16 @@ def _click_join(page, state: _BotState) -> None:
     Flags ``lobby_waiting`` when we hit the "waiting for host to admit you"
     state so the agent can surface that in status.
     
+    After clicking "Join now" (authenticated path), Google Meet may show a
+    "Do you want people to hear you?" modal when headless Chrome has no
+    speaker.  We dismiss it with "Continue without microphone".
+    
     Uses standard click with timeout (NO no_wait_after) — exactly matching
     the working diagnostic script. Playwright waits for the page transition
     to complete before returning, so the DOM is settled when the drain loop
     starts checking admission.
     """
-    for label in ("Join now", "Ask to join"):
+    for label in ("Join now", "Join now without camera", "Ask to join"):
         try:
             btn = page.get_by_role("button", name=label, exact=False).first
             if btn.count() and btn.is_visible():
@@ -863,6 +879,19 @@ def _click_join(page, state: _BotState) -> None:
                 break
         except Exception:
             continue
+
+    # Dismiss the "Do you want people to hear you?" modal that appears
+    # when headless Chrome has no speaker device.
+    try:
+        cont = page.locator(
+            'button:has-text("Continue without microphone")'
+        ).first
+        if cont.count() and cont.is_visible():
+            cont.click(timeout=3_000)
+            print("[meet_bot] dismissed 'Continue without microphone' modal")
+    except Exception:
+        pass
+
     time.sleep(2)
 
 
